@@ -1176,6 +1176,8 @@ class MetalModelRunner:
         if self.kv_cache_dtype is None:
             raise RuntimeError("KV cache dtype not initialized; load_model() first")
         dtype_size = self.kv_cache_dtype.size
+        # GDN recurrent state is always float32 (see GDNPagedStateCache).
+        recurrent_dtype_size = mx.float32.size
         conv_bytes = (
             (self.linear_conv_kernel_dim - 1) * self.linear_conv_dim * dtype_size
         )
@@ -1183,7 +1185,7 @@ class MetalModelRunner:
             self.linear_num_v_heads
             * self.linear_value_head_dim
             * self.linear_key_head_dim
-            * dtype_size
+            * recurrent_dtype_size
         )
         return self.num_linear_layers * (conv_bytes + recurrent_bytes)
 
