@@ -66,7 +66,7 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
+# Documentation build
 docs/_build/
 
 # PyBuilder
@@ -151,3 +151,6 @@ Cargo.lock
 *.bin
 *.safetensors
 *.gguf
+
+# Docs assets fetched at build time
+docs/assets/logos/
