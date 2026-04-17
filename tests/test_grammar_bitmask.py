@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for _apply_grammar_bitmask_metal, _apply_grammar_bitmask_paged,
-and grammar integration in sample_tokens."""
+"""Tests for _apply_grammar_bitmask_paged and grammar integration in
+execute_model / sample_tokens."""
 
 from __future__ import annotations
 
@@ -11,14 +11,14 @@ from unittest.mock import patch
 import mlx.core as mx
 import numpy as np
 import pytest
+from vllm.sampling_params import SamplingParams
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.sample.sampler import Sampler
 
 import vllm_metal.v1.model_runner as mr
+import vllm_metal.v1.structured_output as so
 from tests.stub_runner import make_stub_runner
-from vllm_metal.v1.model_runner import (
-    _apply_grammar_bitmask_metal,
-    _apply_grammar_bitmask_paged,
-)
+from vllm_metal.v1.structured_output import _apply_grammar_bitmask_paged
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -67,6 +67,7 @@ def _make_scheduler_output(req_ids: list[str]) -> SimpleNamespace:
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
+        has_structured_output_requests=False,
     )
 
 
@@ -130,239 +131,6 @@ def _build_cu_seqlens(num_decode: int, prefill_lens: list[int]) -> list[int]:
     for length in prefill_lens:
         cu.append(cu[-1] + length)
     return cu
-
-
-# ---------------------------------------------------------------------------
-# _apply_grammar_bitmask_metal — 2D helper
-# ---------------------------------------------------------------------------
-
-
-class TestApplyGrammarBitmaskMetal:
-    def test_forbidden_tokens_set_to_neg_inf(self) -> None:
-        """Tokens forbidden by the bitmask must become -inf after masking."""
-        allowed_token = 5
-        logits = _uniform_logits_2d(1)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(
-            ["r0"], _make_single_token_bitmask(allowed_token)
-        )
-
-        result = _to_numpy(_apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits))
-
-        assert np.isfinite(result[0, allowed_token])
-        for tok in range(VOCAB_SIZE):
-            if tok != allowed_token:
-                assert result[0, tok] == float("-inf"), (
-                    f"Token {tok} should be forbidden but got {result[0, tok]}"
-                )
-
-    def test_all_allowed_bitmask_leaves_logits_unchanged(self) -> None:
-        """A full bitmask must not change logit values."""
-        data = np.random.randn(1, VOCAB_SIZE).astype(np.float32)
-        logits = mx.array(data)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_full_bitmask())
-
-        result = _to_numpy(_apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits))
-
-        np.testing.assert_allclose(result, data, rtol=1e-5)
-
-    def test_non_structured_rows_unaffected(self) -> None:
-        """Rows without grammar constraints must be unchanged."""
-        logits = mx.array(
-            np.array([[10.0] * VOCAB_SIZE, [10.0] * VOCAB_SIZE], dtype=np.float32)
-        )
-        allowed_token = 3
-        sched = _make_scheduler_output(["plain", "structured"])
-        grammar = _make_grammar_output(
-            ["structured"], _make_single_token_bitmask(allowed_token)
-        )
-
-        result = _to_numpy(
-            _apply_grammar_bitmask_metal(
-                sched, grammar, ["plain", "structured"], logits
-            )
-        )
-
-        np.testing.assert_allclose(
-            result[0], 10.0, err_msg="Plain row must be bit-identical to input"
-        )
-        assert np.isfinite(result[1, allowed_token])
-        for tok in range(VOCAB_SIZE):
-            if tok != allowed_token:
-                assert result[1, tok] == float("-inf")
-
-    def test_batch_order_independent_of_grammar_output_order(self) -> None:
-        """Bitmask must be applied to the correct request even when order differs."""
-        allowed_in_r0 = 7
-        allowed_in_r1 = 13
-        bitmask = np.vstack(
-            [
-                _make_single_token_bitmask(allowed_in_r1),  # listed first, but is r1
-                _make_single_token_bitmask(allowed_in_r0),  # listed second, but is r0
-            ]
-        )
-        logits = _uniform_logits_2d(2)
-        sched = _make_scheduler_output(["r0", "r1"])
-        grammar = _make_grammar_output(["r1", "r0"], bitmask)
-
-        result = _to_numpy(
-            _apply_grammar_bitmask_metal(sched, grammar, ["r0", "r1"], logits)
-        )
-
-        assert np.isfinite(result[0, allowed_in_r0])
-        assert result[0, (allowed_in_r0 + 1) % VOCAB_SIZE] == float("-inf")
-        assert np.isfinite(result[1, allowed_in_r1])
-        assert result[1, (allowed_in_r1 + 1) % VOCAB_SIZE] == float("-inf")
-
-    def test_dtype_preserved_for_float16(self) -> None:
-        logits = mx.zeros((1, VOCAB_SIZE), dtype=mx.float16)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
-
-        result = _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits)
-
-        assert result.dtype == mx.float16, f"Expected float16, got {result.dtype}"
-
-    def test_dtype_preserved_for_bfloat16(self) -> None:
-        logits = mx.zeros((1, VOCAB_SIZE), dtype=mx.bfloat16)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
-
-        result = _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits)
-
-        assert result.dtype == mx.bfloat16
-
-    def test_raises_if_xgrammar_missing(self) -> None:
-        logits = _uniform_logits_2d(1)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
-
-        with patch.object(mr, "xgr", None):
-            with pytest.raises(RuntimeError, match="xgrammar is required"):
-                _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits)
-
-    def test_rejects_3d_logits(self) -> None:
-        """The 2D helper must reject 3D (paged-path) logits with a clear assertion."""
-        logits_3d = _uniform_logits_3d(2)  # shape (1, 2, vocab)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
-
-        with pytest.raises(AssertionError, match="2D"):
-            _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits_3d)
-
-    def test_greedy_argmax_picks_only_allowed_token(self) -> None:
-        allowed_token = 17
-        data = np.random.randn(1, VOCAB_SIZE).astype(np.float32)
-        logits = mx.array(data)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(
-            ["r0"], _make_single_token_bitmask(allowed_token)
-        )
-
-        result = _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits)
-        sampled = int(mx.argmax(result[0]).item())
-
-        assert sampled == allowed_token
-
-    def test_input_array_not_mutated(self) -> None:
-        """Caller-held input mx.array must be unchanged after the call."""
-        rng = np.random.default_rng(42)
-        data = rng.standard_normal((1, VOCAB_SIZE)).astype(np.float32)
-        logits = mx.array(data)
-        sched = _make_scheduler_output(["r0"])
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
-
-        _apply_grammar_bitmask_metal(sched, grammar, ["r0"], logits)
-
-        np.testing.assert_array_equal(_to_numpy(logits), data)
-
-    def test_spec_decode_rows_all_constrained(self) -> None:
-        """With spec-decode tokens, every position (base + speculative) is masked."""
-        # r0 plain, r1 structured with 2 spec tokens:
-        # logits rows: 0=r0, 1=r1-base, 2=r1-spec0, 3=r1-spec1
-        allowed_base = 5
-        allowed_spec0 = 11
-        allowed_spec1 = 21
-        logits = _uniform_logits_2d(4)
-        sched = SimpleNamespace(
-            scheduled_spec_decode_tokens={"r1": [100, 101]},
-            num_scheduled_tokens={"r0": 1, "r1": 3},
-            total_num_scheduled_tokens=4,
-            finished_req_ids=set(),
-        )
-        # grammar_bitmask has 3 rows for r1 (base + 2 spec)
-        bitmask = np.vstack(
-            [
-                _make_single_token_bitmask(allowed_base),
-                _make_single_token_bitmask(allowed_spec0),
-                _make_single_token_bitmask(allowed_spec1),
-            ]
-        )
-        grammar = _make_grammar_output(["r1"], bitmask)
-
-        result = _to_numpy(
-            _apply_grammar_bitmask_metal(sched, grammar, ["r0", "r1"], logits)
-        )
-
-        # r0 row 0: unconstrained
-        assert np.all(np.isfinite(result[0]))
-        # r1 base row 1: constrained to allowed_base
-        assert np.isfinite(result[1, allowed_base])
-        assert result[1, (allowed_base + 1) % VOCAB_SIZE] == float("-inf")
-        # r1 spec rows 2, 3: each constrained to their respective allowed token
-        assert np.isfinite(result[2, allowed_spec0])
-        assert result[2, (allowed_spec0 + 1) % VOCAB_SIZE] == float("-inf")
-        assert np.isfinite(result[3, allowed_spec1])
-        assert result[3, (allowed_spec1 + 1) % VOCAB_SIZE] == float("-inf")
-
-    def test_empty_structured_output_request_ids_returns_unchanged(self) -> None:
-        """Empty structured_output_request_ids must return logits unchanged."""
-        data = np.random.randn(2, VOCAB_SIZE).astype(np.float32)
-        logits = mx.array(data)
-        sched = _make_scheduler_output(["r0", "r1"])
-        grammar = _make_grammar_output([], np.zeros((0, NUM_BITMASK_WORDS), dtype=np.int32))
-
-        result = _to_numpy(
-            _apply_grammar_bitmask_metal(sched, grammar, ["r0", "r1"], logits)
-        )
-
-        np.testing.assert_array_equal(result, data)
-
-    def test_absent_structured_output_req_cumulative_index_correct(self) -> None:
-        """A structured-output req absent from the batch must not desync cumulative_index.
-
-        r0 is absent (preempted), r1 is present. The bitmask has r0's row first,
-        then r1's row. cumulative_index must skip r0's row correctly so r1 gets
-        the right bitmask.
-        """
-        allowed_token = 42
-        logits = _uniform_logits_2d(1)  # only r1 is in this batch
-        sched = _make_scheduler_output(["r1"])
-        bitmask = np.vstack(
-            [
-                _make_single_token_bitmask(0),   # r0's bitmask (not in batch)
-                _make_single_token_bitmask(allowed_token),  # r1's bitmask
-            ]
-        )
-        grammar = _make_grammar_output(["r0", "r1"], bitmask)
-
-        result = _to_numpy(
-            _apply_grammar_bitmask_metal(sched, grammar, ["r1"], logits)
-        )
-
-        # r1's bitmask (row 1) allows only allowed_token — verify the full row.
-        # If cumulative_index were wrong and r0's bitmask (allows token 0) were
-        # applied instead, token 0 would be finite and allowed_token would be -inf.
-        assert np.isfinite(result[0, allowed_token]), (
-            f"allowed_token {allowed_token} should be finite"
-        )
-        assert np.all(result[0, :allowed_token] == float("-inf")), (
-            "all tokens before allowed_token must be forbidden"
-        )
-        assert np.all(result[0, allowed_token + 1:] == float("-inf")), (
-            "all tokens after allowed_token must be forbidden"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +298,7 @@ class TestApplyGrammarBitmaskPaged:
         sched = _make_scheduler_output(["r0"])
         grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
 
-        with patch.object(mr, "xgr", None):
+        with patch.object(so, "xgr", None):
             with pytest.raises(RuntimeError, match="xgrammar is required"):
                 _apply_grammar_bitmask_paged(
                     sched, grammar, decode_reqs, [], cu, 1, logits
@@ -726,7 +494,7 @@ class TestApplyGrammarBitmaskPaged:
 
 
 # ---------------------------------------------------------------------------
-# sample_tokens — non-paged path raises NotImplementedError
+# execute_model — non-paged path raises early for structured output
 # ---------------------------------------------------------------------------
 
 
@@ -734,23 +502,15 @@ class TestSampleTokensGrammarNonPagedPath:
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner()
 
-    def test_non_paged_path_raises_for_grammar_output(self) -> None:
-        """Non-paged path must raise NotImplementedError when grammar_output is set."""
+    def test_non_paged_path_raises_early_in_execute_model(self) -> None:
+        """Non-paged path must raise NotImplementedError in execute_model before
+        any forward pass runs, when structured output is requested."""
         runner = self._make_runner()
-        runner._pending_output = ModelRunnerOutput(
-            req_ids=["r0"],
-            req_id_to_index={"r0": 0},
-            sampled_token_ids=[[5]],
-            logprobs=None,
-            prompt_logprobs_dict={},
-            pooler_output=[None],
-        )
-        runner._execute_model_state = None
-
-        grammar = _make_grammar_output(["r0"], _make_single_token_bitmask(0))
+        scheduler_output = _make_scheduler_output([])
+        scheduler_output.has_structured_output_requests = True
 
         with pytest.raises(NotImplementedError, match="non-paged"):
-            runner.sample_tokens(grammar_output=grammar)
+            runner.execute_model(scheduler_output)
 
     def test_non_paged_path_no_raise_without_grammar(self) -> None:
         """Non-paged path with grammar_output=None must return output normally."""
@@ -767,3 +527,65 @@ class TestSampleTokensGrammarNonPagedPath:
 
         out = runner.sample_tokens(grammar_output=None)
         assert out is pending
+
+
+# ---------------------------------------------------------------------------
+# sample_tokens — paged path applies grammar bitmask before sampling
+# ---------------------------------------------------------------------------
+
+
+class TestSampleTokensGrammarPagedPath:
+    """Integration tests for the paged decode path: execute_model → sample_tokens."""
+
+    def test_grammar_constraint_applied_on_paged_decode(self) -> None:
+        """Grammar bitmask must constrain greedy sampling on the paged path.
+
+        Injects _execute_model_state directly (no live model available in unit
+        tests) to isolate the sample_tokens bitmask-then-sample ordering.
+        Covers the state that execute_model leaves behind after a paged forward.
+        """
+        vocab = 64
+        allowed_token = 5
+
+        runner = make_stub_runner(
+            model_args={"vocab_size": vocab},
+            _paged_request_seq_lens={},
+        )
+        runner._sampler = Sampler()
+
+        req_state = mr.RequestState(
+            token_ids=[1],
+            prompt_len=1,
+            cache=[],
+            sampling_params=SamplingParams(temperature=0.0),
+            generator=None,
+            generated_tokens=0,
+        )
+        decode_reqs = [("r0", req_state)]
+
+        # Uniform logits: without bitmask, greedy argmax = token 0.
+        logits = mx.zeros((1, 1, vocab))
+
+        scheduler_output = _make_scheduler_output(["r0"])
+        grammar_output = _make_grammar_output(
+            ["r0"], _make_single_token_bitmask(allowed_token)
+        )
+
+        # Simulate the paged forward state that execute_model leaves behind.
+        batch = mr._ExecutionBatch()
+        batch.paged_decode_reqs = decode_reqs
+
+        runner._execute_model_state = mr._PagedForwardState(
+            batch=batch,
+            prefill_reqs=[],
+            decode_reqs=decode_reqs,
+            scheduler_output=scheduler_output,
+            logits=logits,
+            cu_seqlens=[0, 1],
+            num_decode=1,
+        )
+
+        output = runner.sample_tokens(grammar_output=grammar_output)
+
+        assert output is not None
+        assert output.sampled_token_ids[0][0] == allowed_token
