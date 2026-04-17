@@ -46,7 +46,11 @@ def _make_single_token_bitmask(
     return bitmask
 
 
-def _make_scheduler_output(req_ids: list[str]) -> SimpleNamespace:
+def _make_scheduler_output(
+    req_ids: list[str],
+    *,
+    has_structured_output_requests: bool = False,
+) -> SimpleNamespace:
     """Minimal SchedulerOutput stub — no spec-decode tokens."""
     return SimpleNamespace(
         scheduled_spec_decode_tokens={},
@@ -67,7 +71,7 @@ def _make_scheduler_output(req_ids: list[str]) -> SimpleNamespace:
         finished_req_ids=set(),
         free_encoder_mm_hashes=[],
         preempted_req_ids=set(),
-        has_structured_output_requests=False,
+        has_structured_output_requests=has_structured_output_requests,
     )
 
 
@@ -506,8 +510,9 @@ class TestSampleTokensGrammarNonPagedPath:
         """Non-paged path must raise NotImplementedError in execute_model before
         any forward pass runs, when structured output is requested."""
         runner = self._make_runner()
-        scheduler_output = _make_scheduler_output([])
-        scheduler_output.has_structured_output_requests = True
+        scheduler_output = _make_scheduler_output(
+            [], has_structured_output_requests=True
+        )
 
         with pytest.raises(NotImplementedError, match="non-paged"):
             runner.execute_model(scheduler_output)

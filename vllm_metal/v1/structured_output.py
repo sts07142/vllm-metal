@@ -152,11 +152,16 @@ def _apply_grammar_bitmask_paged(
     for logit_row, bitmask_row in constrained:
         row_bitmask = torch.from_numpy(grammar_bitmask[bitmask_row : bitmask_row + 1])
         # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
+        # vocab_size is intentionally omitted; xgrammar auto-detects it as
+        # min(logits_width, bitmask_words * 32).  Phantom slots in the last
+        # bitmask word (real_vocab % 32 != 0) get -inf, but the downstream
+        # sampler clips to the real vocabulary so they are never sampled.
         xgr.apply_token_bitmask_inplace(
             logits_torch[logit_row : logit_row + 1], row_bitmask, indices=None
         )
 
-    # torch_to_mlx wraps the numpy buffer of logits_torch; xgrammar mutations
-    # are already complete at this point so the shared-memory read-back is safe.
+    # mx.array(np.ndarray) copies the buffer into MLX memory — all xgrammar
+    # mutations to logits_torch are captured by this copy.  The safety guarantee
+    # comes from mx.array's copy-on-creation semantics, not from mutation ordering.
     result_2d = torch_to_mlx(logits_torch).astype(original_dtype)
     return result_2d[None]  # Restore (1, total_tokens, vocab) shape
