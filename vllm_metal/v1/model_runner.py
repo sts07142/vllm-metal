@@ -1243,6 +1243,20 @@ class MetalModelRunner:
         if self._is_stt:
             return self._execute_stt(scheduler_output)
 
+        # Fail fast before any model work runs.  On the non-paged path,
+        # _handle_new_requests immediately calls _prefill_single for new
+        # requests, so the guard must come before it — not after.
+        if (
+            self._paged_attention_backend is None
+            and scheduler_output.has_structured_output_requests
+        ):
+            raise NotImplementedError(
+                "Grammar/structured-output constraints are not supported on "
+                "the non-paged (legacy) Metal path. "
+                "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
+                "to use structured output."
+            )
+
         batch = _ExecutionBatch()
         self._handle_new_requests(
             batch, scheduler_output.scheduled_new_reqs, scheduler_output
@@ -1268,17 +1282,6 @@ class MetalModelRunner:
             return None
 
         if self._paged_attention_backend is None:
-            # Fail fast: grammar constraints require the paged path so we can
-            # apply them before sampling.  Raise here, before any forward work
-            # runs, rather than in sample_tokens() after tokens are already
-            # sampled and RequestState has been mutated.
-            if scheduler_output.has_structured_output_requests:
-                raise NotImplementedError(
-                    "Grammar/structured-output constraints are not supported on "
-                    "the non-paged (legacy) Metal path. "
-                    "Enable paged attention (VLLM_METAL_USE_PAGED_ATTENTION=1) "
-                    "to use structured output."
-                )
             self._run_non_paged_decode_batch(batch)
 
         # Non-paged path: complete synchronously
