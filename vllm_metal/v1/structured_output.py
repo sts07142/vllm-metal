@@ -114,11 +114,23 @@ def _apply_grammar_bitmask_paged(
 
     grammar_bitmask: np.ndarray = grammar_output.grammar_bitmask
 
+    # Fast path: if none of the structured-output request IDs appear in this
+    # batch, skip row-map construction and cu_seqlens validation entirely.
+    batch_req_ids = (
+        {req_id for req_id, _ in decode_reqs}
+        | {pr.req_id for pr in prefill_reqs}
+    )
+    if not any(
+        rid in batch_req_ids
+        for rid in grammar_output.structured_output_request_ids
+    ):
+        return logits
+
     # cu_seqlens must be exactly [0, 1*decode, ..., +prefill_lens...]: one entry
     # per decode token plus one per prefill sequence, plus the leading zero.
     assert len(cu_seqlens) == num_decode + len(prefill_reqs) + 1, (
-        f"cu_seqlens length {len(cu_seqlens)} != "
-        f"num_decode({num_decode}) + len(prefill_reqs)({len(prefill_reqs)}) + 1"
+        f"cu_seqlens length {len(cu_seqlens)}, "
+        f"expected num_decode={num_decode} + prefill_count={len(prefill_reqs)} + 1"
     )
 
     # Build req_id → sample row index in logits[0].
@@ -149,6 +161,7 @@ def _apply_grammar_bitmask_paged(
     # Apply per constrained row. xgrammar's indices= parameter selects rows from
     # a full-batch bitmask — it does not support a sub-sampled bitmask paired
     # with target logit indices, so we apply row-by-row here.
+    # TODO: batch via indices= once xgrammar supports non-contiguous bitmask selection.
     for logit_row, bitmask_row in constrained:
         row_bitmask = torch.from_numpy(grammar_bitmask[bitmask_row : bitmask_row + 1])
         # Explicit device=cpu: xgrammar has no Metal/MPS kernel.
@@ -160,8 +173,8 @@ def _apply_grammar_bitmask_paged(
             logits_torch[logit_row : logit_row + 1], row_bitmask, indices=None
         )
 
-    # mx.array(np.ndarray) copies the buffer into MLX memory — all xgrammar
-    # mutations to logits_torch are captured by this copy.  The safety guarantee
-    # comes from mx.array's copy-on-creation semantics, not from mutation ordering.
+    # logits_torch is always CPU float32 (produced by torch.from_numpy above),
+    # so torch_to_mlx goes through numpy, which copies the buffer into MLX
+    # memory.  All xgrammar mutations are therefore captured before the copy.
     result_2d = torch_to_mlx(logits_torch).astype(original_dtype)
     return result_2d[None]  # Restore (1, total_tokens, vocab) shape
